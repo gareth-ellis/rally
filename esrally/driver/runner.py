@@ -558,6 +558,7 @@ class BulkIndex(Runner):
         bulk_success_count = 0
         error_details = set()
         bulk_request_size_bytes = 0
+        conflict_count = 0
         total_document_size_bytes = 0
         with_action_metadata = mandatory(params, "action-metadata-present", self)
 
@@ -600,6 +601,8 @@ class BulkIndex(Runner):
                 self.extract_error_details(error_details, data)
             else:
                 bulk_success_count += 1
+            if data["status"] == 409:
+                conflict_count += 1
         stats = {
             "took": response.get("took"),
             "success": bulk_error_count == 0,
@@ -616,6 +619,9 @@ class BulkIndex(Runner):
             self.logger.warning("Bulk request failed: [%s]", stats["error-description"])
         if "ingest_took" in response:
             stats["ingest_took"] = response["ingest_took"]
+        if conflict_count > 0:
+            self.logger.warning("Additional bulk request logging:")
+            self.logger.warning(f"Params {params}")
 
         return stats
 
