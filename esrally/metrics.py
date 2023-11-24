@@ -168,6 +168,10 @@ class EsClient:
             except elasticsearch.helpers.BulkIndexError as e:
                 for err in e.errors:
                     err_type = err.get("index", {}).get("error", {}).get("type", None)
+                    if err_type == "document_parsing_exception" and err.get("index", {}).get("status", None) not in self.retryable_status_codes:
+                        size_payload = len(str(e.errors))
+                        msg = f"{err_type} encountered. Attempting to carry on. Size of payload: {size_payload}"
+                        self.logger.warning(msg)
                     if err.get("index", {}).get("status", None) not in self.retryable_status_codes:
                         msg = f"Unretryable error encountered when sending metrics to remote metrics store: [{err_type}]"
                         self.logger.exception("%s - Full error(s) [%s]", msg, str(e.errors))
