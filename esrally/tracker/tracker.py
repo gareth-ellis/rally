@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import json
 import logging
 import os
 
@@ -48,7 +49,7 @@ def extract_indices_from_data_streams(client, data_streams_to_extract):
     return indices
 
 
-def extract_mappings_and_corpora(client, output_path, indices_to_extract, batch_size):
+def extract_mappings_and_corpora(client, output_path, indices_to_extract, already_indexed, batch_size):
     indices = []
     corpora = []
     # first extract index metadata (which is cheap) and defer extracting data to reduce the potential for
@@ -61,6 +62,9 @@ def extract_mappings_and_corpora(client, output_path, indices_to_extract, batch_
 
     # That list only contains valid indices (with index patterns already resolved)
     for i in indices:
+        if i.get("name") in already_indexed:
+            console.info(f"Skipping {i.get('name')} as already in corpus.json")
+            continue
         c = corpus.extract(client, output_path, i["name"], batch_size)
         if c:
             corpora.append(c)
@@ -77,7 +81,7 @@ def create_track(cfg: types.Config):
     target_hosts = cfg.opts("client", "hosts").default
     client_options = cfg.opts("client", "options").default
     data_streams = cfg.opts("generator", "data_streams")
-    batch_size = cfg.opts("generator", "batch_size")
+    batch_size = int(cfg.opts("generator", "batch_size"))
 
     distribution_flavor, distribution_version, _, _ = factory.cluster_distribution_version(target_hosts, client_options)
     client = factory.EsClientFactory(
@@ -101,20 +105,54 @@ def create_track(cfg: types.Config):
         extracted_indices = extract_indices_from_data_streams(client, data_streams)
         indices = extracted_indices
     logger.info("Creating track [%s] matching indices [%s]", track_name, indices)
+    corpus_path = os.path.join(output_path, "corpus.json")
+    current_indices = []
+    if os.path.exists(corpus_path):
+        with open(corpus_path, "r") as f:
+            current_indices = json.load(f)
+    already_indexed = [index["index_name"] for index in current_indices]
 
-    indices, corpora = extract_mappings_and_corpora(client, output_path, indices, batch_size)
+    indices, corpora = extract_mappings_and_corpora(client, output_path, indices, already_indexed, batch_size)
     if len(indices) == 0:
         raise RuntimeError("Failed to extract any indices for track!")
 
     template_vars = {"track_name": track_name, "indices": indices, "corpora": corpora}
-
     track_path = os.path.join(output_path, "track.json")
+    corpus_path = os.path.join(output_path, "corpus.json")
     default_challenges = os.path.join(challenge_path, "default.json")
     default_operations = os.path.join(operations_path, "default.json")
     templates_path = os.path.join(cfg.opts("node", "rally.root"), "resources")
-    process_template(templates_path, "track.json.j2", template_vars, track_path)
-    process_template(templates_path, "challenges.json.j2", template_vars, default_challenges)
-    process_template(templates_path, "operations.json.j2", template_vars, default_operations)
+
+    if not os.path.exists(default_challenges):
+        process_template(templates_path, "challenges.json.j2", template_vars, default_challenges)
+    else:
+        console.info(f"Default challenges file already exists. Skipping creation.")
+    if not os.path.exists(default_operations):
+        process_template(templates_path, "operations.json.j2", template_vars, default_operations)
+    else:
+        console.info(f"Default operations file already exists. Skipping creation.")
+
+    if not os.path.exists(corpus_path):
+        with open(corpus_path, "w") as fw:
+            fw.write(json.dumps(corpora, indent=2))
+    else:
+        current_file = {}
+        try:
+            with open(corpus_path, "r") as f:
+                current_file = json.load(f)
+            if isinstance(current_file, list):
+                current_file += corpora
+            else:
+                current_file = corpora
+            with open(corpus_path, "w") as fw:
+                fw.write(json.dumps(current_file, indent=2))
+        except ValueError as e:
+            console.error(f"Failed to readtrack file: {e}")
+            process_template(templates_path, "track.json.j2", template_vars, track_path)
+        except Exception as e:
+            console.error(f"Failed to update track file: {e}")
+            logger.exception("Failed to update track file. Corpora data:")
+            logger.exception(corpora)
 
     console.println("")
     console.info(f"Track {track_name} has been created. Run it with: {PROGRAM_NAME} race --track-path={output_path}")
