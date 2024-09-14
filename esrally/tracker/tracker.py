@@ -65,9 +65,12 @@ def extract_mappings_and_corpora(client, output_path, indices_to_extract, alread
         if i.get("name") in already_indexed:
             console.info(f"Skipping {i.get('name')} as already in corpus.json")
             continue
-        c = corpus.extract(client, output_path, i["name"], batch_size)
-        if c:
-            corpora.append(c)
+        try:
+            c = corpus.extract(client, output_path, i["name"], batch_size)
+            if c:
+                corpora.append(c)
+        except (ApiError, TransportError):
+            logging.getLogger(__name__).exception("Failed to extract corpus for index [%s]", i["name"])
 
     return indices, corpora
 

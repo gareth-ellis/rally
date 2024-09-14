@@ -58,13 +58,9 @@ def extract(client, output_path, index, batch_size=1000):
     if total_docs > 0:
         logger.info("[%d] total docs in index [%s].", total_docs, index)
         docs_path = get_doc_outpath(output_path, index)
-        try:
-            dump_documents(client, index, get_doc_outpath(output_path, index, "-1k"), min(total_docs, 1000), batch_size, " for test mode")
-            dump_documents(client, index, docs_path, total_docs, batch_size)
-            return template_vars(index, docs_path, total_docs)
-        except Exception as e:
-            logger.exception(f"Failed to extract corpus for index [{index}]. Exception: {e}")
-            return None
+        dump_documents(client, index, get_doc_outpath(output_path, index, "-1k"), min(total_docs, 1000), batch_size, " for test mode")
+        dump_documents(client, index, docs_path, total_docs, batch_size)
+        return template_vars(index, docs_path, total_docs)
     else:
         logger.info("Skipping corpus extraction fo index [%s] as it contains no documents.", index)
         return None
