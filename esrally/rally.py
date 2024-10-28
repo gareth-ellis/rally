@@ -673,7 +673,7 @@ def create_arg_parser():
     )
     race_parser.add_argument(
         "--on-error",
-        choices=["continue", "abort"],
+        choices=["continue", "abort", "transport"],
         help="Controls how Rally behaves on response errors (default: continue).",
         default="continue",
     )

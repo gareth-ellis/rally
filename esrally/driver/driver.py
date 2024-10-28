@@ -2045,7 +2045,7 @@ async def execute_single(runner, es, params, on_error):
     except elasticsearch.TransportError as e:
         # we *specifically* want to distinguish connection refused (a node died?) from connection timeouts
         # pylint: disable=unidiomatic-typecheck
-        if type(e) is elasticsearch.ConnectionError:
+        if type(e) is elasticsearch.ConnectionError and on_error != "transport":
             fatal_error = True
 
         total_ops = 0
