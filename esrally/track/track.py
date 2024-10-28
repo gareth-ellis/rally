@@ -1097,6 +1097,9 @@ class Task:
         if default_error_behavior == "abort":
             if self.ignore_response_error_level != "non-fatal":
                 behavior = "abort"
+        if default_error_behavior == "transport":
+            if self.ignore_response_error_level != "non-fatal":
+                behavior = "transport"
 
         return behavior
 
