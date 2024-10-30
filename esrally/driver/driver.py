@@ -1945,9 +1945,9 @@ class AsyncExecutor:
                     request_end = request_context.request_end
 
                 processing_end = time.perf_counter()
-                service_time = request_end - request_start
-                processing_time = processing_end - processing_start
-                time_period = request_end - total_start
+                service_time = request_end - request_start if request_end is not None and request_start is not None else None
+                processing_time = processing_end - processing_start if processing_end is not None and processing_start is not None else None
+                time_period = request_end - total_start if request_end is not None and total_start is not None else None
                 self.schedule_handle.after_request(processing_end, total_ops, total_ops_unit, request_meta_data)
                 # Allow runners to override the throughput calculation in very specific circumstances. Usually, Rally
                 # assumes that throughput is the "amount of work" (determined by the "weight") per unit of time
