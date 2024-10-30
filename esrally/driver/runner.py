@@ -2942,14 +2942,18 @@ class RequestTiming(Runner, Delegator):
 
             start = request_context.request_start
             end = request_context.request_end
+            service_time = end - start if end is not None and start is not None else None
             result["dependent_timing"] = {
                 "operation": params.get("name"),
                 "operation-type": params.get("operation-type"),
                 "absolute_time": absolute_time,
                 "request_start": start,
                 "request_end": end,
-                "service_time": end - start,
+                "service_time": service_time,
             }
+            if service_time is None:
+                result["success"] = False
+                result["error_description"] = "Service time could not be determined."
         return result
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
