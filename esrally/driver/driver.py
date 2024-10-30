@@ -1076,18 +1076,24 @@ class SamplePostprocessor:
                 )
 
                 for timing in sample.dependent_timings:
-                    self.metrics_store.put_value_cluster_level(
-                        name="service_time",
-                        value=convert.seconds_to_ms(timing.service_time),
-                        unit="ms",
-                        task=timing.task.name,
-                        operation=timing.operation_name,
-                        operation_type=timing.operation_type,
-                        sample_type=timing.sample_type,
-                        absolute_time=timing.absolute_time,
-                        relative_time=timing.relative_time,
-                        meta_data=self.merge(timing.request_meta_data, client_id_meta_data),
-                    )
+                    try:
+                        self.metrics_store.put_value_cluster_level(
+                            name="service_time",
+                            value=convert.seconds_to_ms(timing.service_time),
+                            unit="ms",
+                            task=timing.task.name,
+                            operation=timing.operation_name,
+                            operation_type=timing.operation_type,
+                            sample_type=timing.sample_type,
+                            absolute_time=timing.absolute_time,
+                            relative_time=timing.relative_time,
+                            meta_data=self.merge(timing.request_meta_data, client_id_meta_data),
+                        )
+                    except TypeError as te:
+                        if timing.service_time is None:
+                            self.logger.error(f"Error storing dependent timing due to missing service_time: {te}")
+                        else:
+                            self.logger.error(f"Error storing dependent timing for an unknown reason: {te}")
 
         end = time.perf_counter()
         self.logger.debug("Storing latency and service time took [%f] seconds.", (end - start))
