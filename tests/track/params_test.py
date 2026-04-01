@@ -1802,6 +1802,141 @@ class TestBulkIndexParamSource:
         assert exc.value.args[0] == "'conflict-probability' must be numeric"
 
 
+class TestOrderedBulkIndexParamSource:
+    def create_reader(self, bulks):
+        def inner_create_reader(docs, *args):
+            return StaticBulkReader(docs.target_index, docs.target_type, bulks)
+
+        return inner_create_reader
+
+    def test_ordered_returns_distinct_client_sources(self):
+        corpus = track.DocumentCorpus(
+            name="default",
+            documents=[
+                track.Documents(
+                    source_format=track.Documents.SOURCE_FORMAT_BULK,
+                    number_of_documents=4,
+                    target_index="test-idx",
+                    target_type="test-type",
+                )
+            ],
+        )
+        source = params.BulkIndexParamSource(
+            track=track.Track(name="unit-test", corpora=[corpus]),
+            params={
+                "bulk-size": 1,
+                "ordered-bulk-delivery": True,
+                "__create_reader": self.create_reader([["a"], ["b"], ["c"], ["d"]]),
+            },
+        )
+        assert isinstance(source.param_source, params.OrderedPartitionBulkIndexParamSource)
+        p0 = source.partition(0, 2)
+        p1 = source.partition(1, 2)
+        assert isinstance(p0, params.ClientOrderedBulkIndexParamSource)
+        assert isinstance(p1, params.ClientOrderedBulkIndexParamSource)
+        assert p0 is not p1
+
+    def test_ordered_round_robin_per_client_queues(self):
+        corpus = track.DocumentCorpus(
+            name="default",
+            documents=[
+                track.Documents(
+                    source_format=track.Documents.SOURCE_FORMAT_BULK,
+                    number_of_documents=4,
+                    target_index="test-idx",
+                    target_type="test-type",
+                )
+            ],
+        )
+        source = params.BulkIndexParamSource(
+            track=track.Track(name="unit-test", corpora=[corpus]),
+            params={
+                "bulk-size": 1,
+                "ordered-bulk-delivery": True,
+                "__create_reader": self.create_reader([["a"], ["b"], ["c"], ["d"]]),
+            },
+        )
+        c0 = source.partition(0, 2)
+        c1 = source.partition(1, 2)
+        assert c0.params()["body"] == ["a"]
+        assert c1.params()["body"] == ["b"]
+        assert c0.params()["body"] == ["c"]
+        assert c1.params()["body"] == ["d"]
+        with pytest.raises(StopIteration):
+            c0.params()
+        with pytest.raises(StopIteration):
+            c1.params()
+
+    def test_corpus_meta_enables_ordered_delivery(self):
+        corpus = track.DocumentCorpus(
+            name="default",
+            meta_data={"ordered-bulk-delivery": True},
+            documents=[
+                track.Documents(
+                    source_format=track.Documents.SOURCE_FORMAT_BULK,
+                    number_of_documents=2,
+                    target_index="test-idx",
+                    target_type="test-type",
+                )
+            ],
+        )
+        source = params.BulkIndexParamSource(
+            track=track.Track(name="unit-test", corpora=[corpus]),
+            params={
+                "bulk-size": 1,
+                "__create_reader": self.create_reader([["x"], ["y"]]),
+            },
+        )
+        assert isinstance(source.param_source, params.OrderedPartitionBulkIndexParamSource)
+
+    def test_operation_overrides_corpus_meta(self):
+        corpus = track.DocumentCorpus(
+            name="default",
+            meta_data={"ordered-bulk-delivery": True},
+            documents=[
+                track.Documents(
+                    source_format=track.Documents.SOURCE_FORMAT_BULK,
+                    number_of_documents=2,
+                    target_index="test-idx",
+                    target_type="test-type",
+                )
+            ],
+        )
+        source = params.BulkIndexParamSource(
+            track=track.Track(name="unit-test", corpora=[corpus]),
+            params={
+                "bulk-size": 1,
+                "ordered-bulk-delivery": False,
+                "__create_reader": self.create_reader([["x"], ["y"]]),
+            },
+        )
+        assert isinstance(source.param_source, params.PartitionBulkIndexParamSource)
+
+    def test_invalid_ordered_bulk_queue_depth(self):
+        corpus = track.DocumentCorpus(
+            name="default",
+            documents=[
+                track.Documents(
+                    source_format=track.Documents.SOURCE_FORMAT_BULK,
+                    number_of_documents=2,
+                    target_index="test-idx",
+                    target_type="test-type",
+                )
+            ],
+        )
+        with pytest.raises(exceptions.InvalidSyntax) as exc:
+            params.BulkIndexParamSource(
+                track=track.Track(name="unit-test", corpora=[corpus]),
+                params={
+                    "bulk-size": 1,
+                    "ordered-bulk-delivery": True,
+                    "ordered-bulk-queue-depth": 0,
+                    "__create_reader": self.create_reader([["x"], ["y"]]),
+                },
+            )
+        assert "ordered-bulk-queue-depth" in exc.value.args[0]
+
+
 class TestBulkDataGenerator:
     @classmethod
     def create_test_reader(cls, batches):

@@ -516,6 +516,15 @@
             "minimum": 1,
             "description": "[Only for type == 'index']: Defines the bulk size."
           },
+          "ordered-bulk-delivery": {
+            "type": "boolean",
+            "description": "[Only for type == 'bulk']: When true, a single producer thread feeds each client in round-robin order so bulk document order is stable under concurrent clients. Overrides corpus meta `ordered-bulk-delivery` when set."
+          },
+          "ordered-bulk-queue-depth": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "[Only for type == 'bulk' with ordered-bulk-delivery]: Max bulks buffered per client queue (default 4)."
+          },
           "pipeline": {
             "type": "string",
             "description": "[Only for type == 'index']: Defines the name of the ingest node pipeline to use."

@@ -23,7 +23,9 @@ import logging
 import math
 import numbers
 import operator
+import queue
 import random
+import threading
 import time
 from abc import ABC
 from enum import Enum
@@ -564,6 +566,32 @@ class IndexIdConflict(Enum):
     RandomConflicts = 2
 
 
+_ORDERED_BULK_SENTINEL_STOP = object()
+
+
+def _effective_ordered_bulk_delivery(corpora, params):
+    """
+    Operation parameter ``ordered-bulk-delivery`` overrides corpus meta ``meta.ordered-bulk-delivery``.
+    If any selected corpus sets the meta flag to true and the operation does not set the parameter, delivery is ordered.
+    """
+    if "ordered-bulk-delivery" in params:
+        v = params["ordered-bulk-delivery"]
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            lv = v.lower()
+            if lv in ("true", "1", "yes"):
+                return True
+            if lv in ("false", "0", "no"):
+                return False
+        raise exceptions.InvalidSyntax("'ordered-bulk-delivery' must be a boolean")
+    for c in corpora:
+        md = c.meta_data or {}
+        if md.get("ordered-bulk-delivery") in (True, "true", "1", "yes", "True"):
+            return True
+    return False
+
+
 class BulkIndexParamSource(ParamSource):
     def __init__(self, track, params, **kwargs):
         super().__init__(track, params, **kwargs)
@@ -657,21 +685,48 @@ class BulkIndexParamSource(ParamSource):
             self.ingest_doc_count = None
         self.refresh = params.get("refresh")
         self.looped = params.get("looped", False)
-        self.param_source = PartitionBulkIndexParamSource(
-            self.corpora,
-            self.batch_size,
-            self.bulk_size,
-            self.ingest_percentage,
-            self.ingest_doc_count,
-            self.id_conflicts,
-            self.conflict_probability,
-            self.on_conflict,
-            self.recency,
-            self.pipeline,
-            self.refresh,
-            self.looped,
-            self._params,
-        )
+        self.ordered_bulk_delivery = _effective_ordered_bulk_delivery(self.corpora, params)
+        if self.ordered_bulk_delivery:
+            try:
+                self.ordered_bulk_queue_depth = int(params.get("ordered-bulk-queue-depth", 4))
+                if self.ordered_bulk_queue_depth < 1:
+                    raise exceptions.InvalidSyntax(
+                        "'ordered-bulk-queue-depth' must be positive but was %d" % self.ordered_bulk_queue_depth
+                    )
+            except ValueError:
+                raise exceptions.InvalidSyntax("'ordered-bulk-queue-depth' must be numeric")
+            self.param_source = OrderedPartitionBulkIndexParamSource(
+                self.corpora,
+                self.batch_size,
+                self.bulk_size,
+                self.ingest_percentage,
+                self.ingest_doc_count,
+                self.id_conflicts,
+                self.conflict_probability,
+                self.on_conflict,
+                self.recency,
+                self.pipeline,
+                self.refresh,
+                self.looped,
+                self._params,
+                self.ordered_bulk_queue_depth,
+            )
+        else:
+            self.param_source = PartitionBulkIndexParamSource(
+                self.corpora,
+                self.batch_size,
+                self.bulk_size,
+                self.ingest_percentage,
+                self.ingest_doc_count,
+                self.id_conflicts,
+                self.conflict_probability,
+                self.on_conflict,
+                self.recency,
+                self.pipeline,
+                self.refresh,
+                self.looped,
+                self._params,
+            )
 
     def float_param(self, params, name, default_value, min_value, max_value, min_operator=operator.le):
         try:
@@ -711,9 +766,8 @@ class BulkIndexParamSource(ParamSource):
         return corpora
 
     def partition(self, partition_index, total_partitions):
-        # register the new partition internally
-        self.param_source.partition(partition_index, total_partitions)
-        return self.param_source
+        # Delegate so ordered bulk delivery can return a per-client facade (see OrderedPartitionBulkIndexParamSource).
+        return self.param_source.partition(partition_index, total_partitions)
 
     def params(self):
         raise exceptions.RallyError("Do not use a BulkIndexParamSource without partitioning")
@@ -789,6 +843,7 @@ class PartitionBulkIndexParamSource:
                 f"Total partitions is expected to be [{self.total_partitions}] but was [{total_partitions}]"
             )
         self.partitions.append(partition_index)
+        return self
 
     def params(self):
         if self.current_bulk == 0:
@@ -846,6 +901,167 @@ class PartitionBulkIndexParamSource:
     @property
     def percent_completed(self):
         return self.current_bulk / self.total_bulks
+
+
+class ClientOrderedBulkIndexParamSource:
+    """
+    Per-client view for ordered bulk delivery: ``params()`` reads from this client's queue only.
+    """
+
+    def __init__(self, coordinator: "OrderedPartitionBulkIndexParamSource", partition_index: int):
+        self._coord = coordinator
+        self._partition_index = partition_index
+
+    def params(self):
+        return self._coord.get_params_for_partition(self._partition_index)
+
+    @property
+    def percent_completed(self):
+        return self._coord.percent_completed
+
+    @property
+    def infinite(self):
+        return self._coord.infinite
+
+
+class OrderedPartitionBulkIndexParamSource:
+    """
+    Single-producer bulk delivery: one thread walks ``bulk_data_based`` sequentially and round-robins
+    each bulk to the client's queue (stable order by sorted partition index). Bounded queues provide backpressure.
+    """
+
+    def __init__(
+        self,
+        corpora,
+        batch_size,
+        bulk_size,
+        ingest_percentage,
+        ingest_doc_count,
+        id_conflicts,
+        conflict_probability,
+        on_conflict,
+        recency,
+        pipeline=None,
+        refresh=None,
+        looped: bool = False,
+        original_params=None,
+        queue_depth: int = 4,
+    ):
+        self.corpora = corpora
+        self.partitions: list[int] = []
+        self.total_partitions = None
+        self.batch_size = batch_size
+        self.bulk_size = bulk_size
+        self.ingest_percentage = ingest_percentage
+        self.ingest_doc_count = ingest_doc_count
+        self.id_conflicts = id_conflicts
+        self.conflict_probability = conflict_probability
+        self.on_conflict = on_conflict
+        self.recency = recency
+        self.pipeline = pipeline
+        self.refresh = refresh
+        self.looped = looped
+        self.queue_depth = queue_depth
+        self._template_params = dict(original_params) if original_params else {}
+        self.create_reader = self._template_params.pop("__create_reader", create_default_reader)
+        self.total_bulks = 1
+        self.clients_order: list[int] = []
+        self.queues: dict[int, queue.Queue] = {}
+        self._lock = threading.Lock()
+        self._producer_started = False
+        self._issued_total = 0
+        self._producer_thread: threading.Thread | None = None
+        self.infinite = bool(looped)
+
+    def partition(self, partition_index, total_partitions):
+        if self.total_partitions is None:
+            self.total_partitions = total_partitions
+        elif self.total_partitions != total_partitions:
+            raise exceptions.RallyAssertionError(
+                f"Total partitions is expected to be [{self.total_partitions}] but was [{total_partitions}]"
+            )
+        self.partitions.append(partition_index)
+        return ClientOrderedBulkIndexParamSource(self, partition_index)
+
+    def _compute_total_bulks(self, start_index: int, end_index: int) -> None:
+        all_bulks = number_of_bulks(self.corpora, start_index, end_index, self.total_partitions, self.bulk_size)
+        if self.ingest_doc_count is not None:
+            num_partitions_served = end_index - start_index + 1
+            docs_for_these_partitions = (self.ingest_doc_count // self.total_partitions) * num_partitions_served
+            if docs_for_these_partitions % self.bulk_size != 0:
+                raise exceptions.InvalidSyntax(
+                    f"'ingest-doc-count' divided by the number of partitions ({self.total_partitions})"
+                    f" must be a multiple of 'bulk-size' ({self.bulk_size}) but was {docs_for_these_partitions // num_partitions_served}"
+                )
+            self.total_bulks = docs_for_these_partitions // self.bulk_size
+        else:
+            self.total_bulks = math.ceil((all_bulks * self.ingest_percentage) / 100)
+
+    def _ensure_producer(self) -> None:
+        with self._lock:
+            if self._producer_started:
+                return
+            self.partitions = sorted(self.partitions)
+            if not self.partitions:
+                raise exceptions.RallyAssertionError("No partitions registered for ordered bulk delivery.")
+            self.clients_order = list(self.partitions)
+            start_index = self.partitions[0]
+            end_index = self.partitions[-1]
+            self._compute_total_bulks(start_index, end_index)
+            self.queues = {p: queue.Queue(maxsize=self.queue_depth) for p in self.partitions}
+            self._producer_started = True
+            self._producer_thread = threading.Thread(target=self._producer_loop, name="rally-ordered-bulk-producer", daemon=True)
+            self._producer_thread.start()
+
+    def _producer_loop(self) -> None:
+        while True:
+            start_index = self.partitions[0]
+            end_index = self.partitions[-1]
+            bulk_iter = bulk_data_based(
+                self.total_partitions,
+                start_index,
+                end_index,
+                self.corpora,
+                self.batch_size,
+                self.bulk_size,
+                self.id_conflicts,
+                self.conflict_probability,
+                self.on_conflict,
+                self.recency,
+                self.pipeline,
+                self._template_params,
+                self.create_reader,
+            )
+            n_clients = len(self.clients_order)
+            for k in range(self.total_bulks):
+                try:
+                    bulk_params = next(bulk_iter)
+                except StopIteration:
+                    break
+                target = self.clients_order[k % n_clients]
+                self.queues[target].put(bulk_params)
+            if not self.looped:
+                for p in self.partitions:
+                    self.queues[p].put(_ORDERED_BULK_SENTINEL_STOP)
+                return
+
+    def get_params_for_partition(self, partition_index: int):
+        self._ensure_producer()
+        item = self.queues[partition_index].get()
+        if item is _ORDERED_BULK_SENTINEL_STOP:
+            raise StopIteration()
+        with self._lock:
+            self._issued_total += 1
+        return item
+
+    @property
+    def percent_completed(self):
+        if self.total_bulks <= 0:
+            return 1.0
+        with self._lock:
+            if self.looped:
+                return (self._issued_total % self.total_bulks) / self.total_bulks
+            return min(self._issued_total / self.total_bulks, 1.0)
 
 
 class OpenPointInTimeParamSource(ParamSource):
