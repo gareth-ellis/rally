@@ -17,6 +17,7 @@
 
 import asyncio
 import contextvars
+import gzip
 import json
 import logging
 import random
@@ -237,6 +238,38 @@ class Runner:
             headers.update({"x-opaque-id": opaque_id})
 
         return params, request_params, transport_params, headers
+
+    def compress_body(self, body, compression_method: str) -> tuple[bytes, dict]:
+        """
+        Compresses the body of a request
+
+        :param body: The body of the request.
+        :param compression_method: The compression method to use. gzip, ia
+        :return: The compressed body.
+        """
+        try:
+            import isal.igzip as igzip
+
+            HAS_ISAL = True
+        except ImportError:
+            HAS_ISAL = False
+        stats = {}
+        if compression_method == "gzip" or not HAS_ISAL:
+            if not HAS_ISAL:
+                logging.warning("ISAL is not installed. Falling back to gzip.")
+            start_time = time.time()
+            body = gzip.compress(body.encode("utf-8"))
+            end_time = time.time()
+            stats["meta.compression_method"] = "gzip"
+        elif compression_method == "isal":
+            start_time = time.time()
+            body = igzip.compress(body.encode("utf-8"))
+            end_time = time.time()
+            stats["meta.compression_method"] = "isal"
+        else:
+            raise ValueError(f"Unsupported compression method: {compression_method}")
+        stats["meta.compression_time"] = end_time - start_time
+        return body, stats
 
 
 class Delegator:
@@ -476,6 +509,8 @@ class BulkStats:
     total_document_size_bytes: int = 0
     ingest_took: Optional[int] = None
     retry_count: int = 0
+    http_compression_time: float = 0
+    http_compression_method: str = ""
 
     @property
     def success(self) -> bool:
@@ -507,6 +542,11 @@ class BulkStats:
             self.shards_histogram = []
         self.ingest_took = None
 
+    def store_compression_stats(self, compression_stats):
+        self.http_compression_time += compression_stats["http-compression-time"]
+        # we dont need to keep previous compression methods, at the moment each compression attempt will use the same method.
+        self.http_compression_method = compression_stats["http-compression-method"]
+
     def as_dict(self) -> dict:
         d = {
             "took": self.took,
@@ -530,6 +570,9 @@ class BulkStats:
             d["total-document-size-bytes"] = self.total_document_size_bytes
         if self.ingest_took is not None:
             d["ingest_took"] = self.ingest_took
+        if self.http_compression_time is not None:
+            d["http-compression-time"] = self.http_compression_time
+            d["http-compression-method"] = self.http_compression_method
         return d
 
 
@@ -576,6 +619,16 @@ class BulkIndex(Runner):
         detailed_results = params.get("detailed-results", False)
         api_kwargs = self._default_kw_params(params)
         bulk_params = {}
+        compression_method = params.get("compression-method", "isal")
+        http_compression = params.get("http_compression", False)
+        if http_compression:
+            if compression_method not in ("gzip", "isal"):
+                raise exceptions.RallyAssertionError(
+                    f"Unsupported compression method: {compression_method}. Use one of [{', '.join(["gzip", "isal"])}]."
+                )
+            api_kwargs["headers"].update({"Content-Encoding": "gzip"})
+            body, compression_stats = self.compress_body(api_kwargs["body"], compression_method)
+            api_kwargs["body"] = body
         if "timeout" in params:
             bulk_params["timeout"] = params["timeout"]
         if "pipeline" in params:
@@ -603,17 +656,25 @@ class BulkIndex(Runner):
             response = await es.bulk(doc_type=params.get("type"), params=bulk_params, **api_kwargs)
 
         stats = self._parse_stats(params, bulk_size, unit, response, api_kwargs, detailed_results)
+        if http_compression:
+            stats.store_compression_stats(compression_stats)
 
         for i in range(retries_on_429):
             if not stats.error_429_indices:
                 break
             lines_to_retry = self._build_retry_body(api_kwargs, stats.error_429_indices)
-            self.logger.warning("Retrying %d documents that previously resulted in a 429.", len(lines_to_retry) / 2)
-            api_kwargs["body"] = lines_to_retry
+            if http_compression:
+                compressed_body, compression_stats = self.compress_body(api_kwargs["body"], compression_method)
+                api_kwargs["body"] = compressed_body
+            else:
+                api_kwargs["body"] = lines_to_retry
             bulk_size = len(lines_to_retry) / 2
+            self.logger.warning("Retrying %d documents that previously resulted in a 429.", bulk_size)
             response = await es.bulk(params=bulk_params, **api_kwargs)
             retry_result = self._parse_stats(params, bulk_size, unit, response, api_kwargs, detailed_results)
             stats.accumulate(retry_result)
+            if http_compression:
+                stats.store_compression_stats(compression_stats)
             if response.meta.status not in (200, 201, 429):
                 self.logger.debug("%s after bulk request retry. Payload: %s", response.meta.status, lines_to_retry)
                 self.logger.warning("Bulk request retry failed after %d attempts: [%s]", i, response.meta.status)
